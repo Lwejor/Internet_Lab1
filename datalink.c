@@ -1,22 +1,37 @@
 #include <stdio.h>
 #include <string.h>
+#include<stdbool.h>
 
 #include "protocol.h"
 #include "datalink.h"
-
+#define MAX_SEQ 7
 #define DATA_TIMER  2000
 
-struct FRAME { 
+typedef struct FRAME { 
     unsigned char kind; /* FRAME_DATA */
     unsigned char ack;
     unsigned char seq;
     unsigned char data[PKT_LEN]; 
     unsigned int  padding;
-};
+}frame;
 
-static unsigned char frame_nr = 0, buffer[PKT_LEN], nbuffered;
-static unsigned char frame_expected = 0;
-static int phl_ready = 0;
+typedef struct {
+    unsigned char data[PKT_LEN];
+}packet;
+
+typedef unsigned char seq_nr;
+
+packet buffer[MAX_SEQ+1];   //数据包缓存
+seq_nr nbuffered = 0;     //发送窗口长度
+seq_nr frame_expected = 0;    //接受窗口希望的帧
+seq_nr ack_expected = 0;      //希望ack的帧
+seq_nr next_frame_to_send = 0;    //将要发送的帧
+static int phl_ready = 0;   //物理层是否准备好
+
+static bool between(seq_nr a, seq_nr b, seq_nr c)
+{
+    return (( a<=b )&&( b<c )) || (( c<a )&&( a<=b )) || (( b<c )&&( c<a )); 
+}
 
 static void put_frame(unsigned char *frame, int len)
 {
@@ -25,14 +40,14 @@ static void put_frame(unsigned char *frame, int len)
     phl_ready = 0;
 }
 
-static void send_data_frame(void)
+static void send_data_frame(seq_nr frame_nr, seq_nr frame_expected, packet buffer[])
 {
-    struct FRAME s;
+    frame s;
 
     s.kind = FRAME_DATA;
     s.seq = frame_nr;
-    s.ack = 1 - frame_expected;
-    memcpy(s.data, buffer, PKT_LEN);
+    s.ack = (frame_expected + MAX_SEQ) % (MAX_SEQ + 1);
+    memcpy(s.data, buffer[frame_nr].data, PKT_LEN);
 
     dbg_frame("Send DATA %d %d, ID %d\n", s.seq, s.ack, *(short *)s.data);
 
@@ -40,22 +55,18 @@ static void send_data_frame(void)
     start_timer(frame_nr, DATA_TIMER);
 }
 
-static void send_ack_frame(void)
+static void inc(k)
 {
-    struct FRAME s;
-
-    s.kind = FRAME_ACK;
-    s.ack = 1 - frame_expected;
-
-    dbg_frame("Send ACK  %d\n", s.ack);
-
-    put_frame((unsigned char *)&s, 2);
+    if(k < MAX_SEQ)
+        k = k + 1;
+    else 
+        k = 0;
 }
 
 int main(int argc, char **argv)
 {
     int event, arg;
-    struct FRAME f;
+    frame f;
     int len = 0;
 
     protocol_init(argc, argv); 
@@ -68,9 +79,10 @@ int main(int argc, char **argv)
 
         switch (event) {
         case NETWORK_LAYER_READY:
-            get_packet(buffer);
+            get_packet(buffer[next_frame_to_send].data);
             nbuffered++;
-            send_data_frame();
+            send_data_frame(next_frame_to_send, frame_expected, &buffer);
+            inc(next_frame_to_send);
             break;
 
         case PHYSICAL_LAYER_READY:
@@ -83,30 +95,33 @@ int main(int argc, char **argv)
                 dbg_event("**** Receiver Error, Bad CRC Checksum\n");
                 break;
             }
-            if (f.kind == FRAME_ACK) 
-                dbg_frame("Recv ACK  %d\n", f.ack);
             if (f.kind == FRAME_DATA) {
                 dbg_frame("Recv DATA %d %d, ID %d\n", f.seq, f.ack, *(short *)f.data);
                 if (f.seq == frame_expected) {
                     put_packet(f.data, len - 7);
-                    frame_expected = 1 - frame_expected;
+                    inc(frame_expected);
                 }
-                send_ack_frame();
             } 
-            if (f.ack == frame_nr) {
-                stop_timer(frame_nr);
+            while(between(ack_expected, f.ack, next_frame_to_send))
+            {
                 nbuffered--;
-                frame_nr = 1 - frame_nr;
+                stop_timer(ack_expected);
+                inc(ack_expected);
             }
             break; 
 
         case DATA_TIMEOUT:
             dbg_event("---- DATA %d timeout\n", arg); 
-            send_data_frame();
+            next_frame_to_send = ack_expected;
+            for(int i = 1; i <= nbuffered; i++)
+            {
+                send_data_frame(next_frame_to_send, frame_expected, &buffer);
+                inc(next_frame_to_send);
+            }
             break;
         }
 
-        if (nbuffered < 1 && phl_ready)
+        if ((nbuffered < MAX_SEQ) && phl_ready)
             enable_network_layer();
         else
             disable_network_layer();
